@@ -66,7 +66,7 @@ python pipeline.py --input ./samples --output results.csv --verbose
 | `--input` | Path to an audio file or folder | required |
 | `--output` | Path to the output CSV | `emotion_log.csv` |
 | `--backend` | `gemini` (cloud) or `local` (offline) | `gemini` |
-| `--model` | Gemini model name (ignored for `local`) | `gemini-1.5-flash` |
+| `--model` | Gemini model name (ignored for `local`) | `gemini-2.5-flash` |
 | `--no-transcribe` | Skip Whisper transcription in local backend | off |
 | `--verbose` | Print each row to the console as it is processed | off |
 
@@ -74,11 +74,11 @@ Supported input formats: `.wav`, `.mp3`, `.m4a`, `.ogg`, `.flac`.
 
 ### Switching backends
 ```bash
-# Free cloud model (default)
+# Default Gemini model (gemini-2.5-flash)
 python pipeline.py --input ./samples
 
-# Pin to a different Gemini model if you hit free-tier quota
-python pipeline.py --input ./samples --model gemini-2.5-flash
+# Pin to a different Gemini model (e.g. cheaper / more free quota)
+python pipeline.py --input ./samples --model gemini-1.5-flash
 
 # Fully offline — no API key, no network, no quota
 python pipeline.py --input ./samples --backend local

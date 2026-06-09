@@ -69,7 +69,7 @@ Scoring guide:
 
 USER_PROMPT: str = "Analyze the attached audio clip and return the JSON object."
 
-GEMINI_MODEL: str = "gemini-1.5-flash"
+GEMINI_MODEL: str = "gemini-2.5-flash"
 
 LOCAL_EMOTION_MODEL: str = "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
 LOCAL_WHISPER_MODEL: str = "openai/whisper-small"

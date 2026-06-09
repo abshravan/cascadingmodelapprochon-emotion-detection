@@ -101,6 +101,16 @@ class AudioPreprocessor:
         return audio[start: duration - end]
 
     @staticmethod
+    def is_silent(audio: AudioSegment, silence_dbfs: float = -45.0) -> bool:
+        """Return True if a chunk is effectively silent (no speech energy).
+
+        Skipping silent chunks locally avoids spending free-tier requests on
+        clips the model would just return -1 / 'low confidence' for anyway.
+        """
+        dbfs = audio.dBFS
+        return dbfs == float("-inf") or dbfs < silence_dbfs
+
+    @staticmethod
     def chunk_audio(
         audio: AudioSegment,
         chunk_ms: int = 60_000,
@@ -139,28 +149,74 @@ class AudioPreprocessor:
         self._temp_files.clear()
 
 
+class RateLimiter:
+    """Sleeps just enough to keep call rate at or below `rpm` requests/minute."""
+
+    def __init__(self, rpm: int) -> None:
+        self._interval = 60.0 / rpm if rpm and rpm > 0 else 0.0
+        self._last_call: float = 0.0
+
+    def wait(self) -> None:
+        if self._interval <= 0:
+            return
+        elapsed = time.monotonic() - self._last_call
+        if elapsed < self._interval:
+            time.sleep(self._interval - elapsed)
+        self._last_call = time.monotonic()
+
+
+class QuotaExhaustedError(RuntimeError):
+    """Raised when daily request budget is hit so the batch can stop cleanly."""
+
+
 class GeminiAnalyzer:
-    """Wraps Gemini 2.0 Flash audio analysis with retry and JSON parsing."""
+    """Wraps Gemini audio analysis with throttling, smart retry, JSON parsing."""
 
     _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
+    _RETRY_DELAY_RE = re.compile(r"retry_delay\s*\{\s*seconds:\s*(\d+)", re.IGNORECASE)
+    _RATE_LIMIT_HINTS = ("429", "quota", "resourceexhausted", "rate limit")
 
-    def __init__(self, api_key: str, model_name: str = GEMINI_MODEL) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = GEMINI_MODEL,
+        rpm: int = 10,
+        max_requests: int | None = None,
+    ) -> None:
         if not api_key:
             raise ValueError("GEMINI_API_KEY is required")
         genai.configure(api_key=api_key)
+        self._model_name = model_name
         self._model = genai.GenerativeModel(
             model_name=model_name,
             system_instruction=SYSTEM_INSTRUCTION,
         )
+        self._limiter = RateLimiter(rpm)
+        self._max_requests = max_requests
+        self._request_count = 0
+
+        # Free-tier saver: disable "thinking" tokens on 2.5-class models.
+        # The structured-JSON task doesn't need chain-of-thought, and thinking
+        # tokens can easily 2-3x the per-call token cost.
+        self._generation_config: dict[str, Any] = {"response_mime_type": "application/json"}
+        if "2.5" in model_name:
+            self._generation_config["thinking_config"] = {"thinking_budget": 0}
 
     def analyze(self, audio_path: Path) -> dict[str, Any]:
         """Upload and analyze a single audio clip. Returns parsed dict + raw text."""
+        if self._max_requests is not None and self._request_count >= self._max_requests:
+            raise QuotaExhaustedError(
+                f"Reached --max-requests limit of {self._max_requests}; stopping."
+            )
+
         def _call() -> Any:
+            self._limiter.wait()
+            self._request_count += 1
             uploaded = genai.upload_file(path=str(audio_path))
             try:
                 return self._model.generate_content(
                     [USER_PROMPT, uploaded],
-                    generation_config={"response_mime_type": "application/json"},
+                    generation_config=self._generation_config,
                 )
             finally:
                 try:
@@ -188,19 +244,40 @@ class GeminiAnalyzer:
                 raise ValueError(f"No JSON object found in response: {text[:200]}")
             return json.loads(match.group(0))
 
-    @staticmethod
-    def _retry_with_backoff(fn: Callable[[], Any], retries: int = 3) -> Any:
-        """Run fn up to `retries` times with 2s, 4s, 8s backoff."""
+    @classmethod
+    def _is_rate_limit(cls, exc: BaseException) -> bool:
+        msg = f"{type(exc).__name__} {exc}".lower()
+        return any(hint in msg for hint in cls._RATE_LIMIT_HINTS)
+
+    @classmethod
+    def _extract_retry_delay(cls, exc: BaseException) -> float | None:
+        match = cls._RETRY_DELAY_RE.search(str(exc))
+        return float(match.group(1)) if match else None
+
+    @classmethod
+    def _retry_with_backoff(cls, fn: Callable[[], Any], retries: int = 3) -> Any:
+        """Retry fn up to `retries` times.
+
+        On 429/quota errors we honor the server-supplied `retry_delay` instead
+        of stacking exponential backoff on top of it — that combination would
+        either guarantee another 429 (delay too short) or waste a chunk of
+        the daily request budget (delay way too long).
+        """
         last_exc: Exception | None = None
         for attempt in range(retries):
             try:
                 return fn()
-            except Exception as exc:  # noqa: BLE001 - surface to caller after retries
+            except Exception as exc:  # noqa: BLE001 - surface after retries
                 last_exc = exc
-                wait = 2 ** (attempt + 1)
+                is_429 = cls._is_rate_limit(exc)
+                if is_429:
+                    server_wait = cls._extract_retry_delay(exc) or 30.0
+                    wait = min(server_wait + 1.0, 65.0)
+                else:
+                    wait = float(2 ** (attempt + 1))
                 logger.warning(
-                    "Gemini call failed (attempt %d/%d): %s. Retrying in %ds.",
-                    attempt + 1, retries, exc, wait,
+                    "Gemini call failed (attempt %d/%d, rate_limited=%s): %s. Retrying in %.1fs.",
+                    attempt + 1, retries, is_429, str(exc).split("\n", 1)[0], wait,
                 )
                 if attempt < retries - 1:
                     time.sleep(wait)
@@ -343,6 +420,25 @@ class CSVLogger:
         if not self.output_path.exists():
             pd.DataFrame(columns=CSV_COLUMNS).to_csv(self.output_path, index=False)
 
+    def already_done(self) -> set[tuple[str, int]]:
+        """Return (filename, chunk_index) pairs already logged successfully.
+
+        Used to resume an interrupted batch without burning quota on chunks
+        that already have a clean row. Error rows are not skipped so reruns
+        will retry past failures.
+        """
+        try:
+            df = pd.read_csv(self.output_path, usecols=["filename", "chunk_index", "error"])
+        except (FileNotFoundError, ValueError, pd.errors.EmptyDataError):
+            return set()
+        if df.empty:
+            return set()
+        done = df[df["error"].isna() | (df["error"].astype(str).str.strip() == "")]
+        return {
+            (str(row.filename), int(row.chunk_index))
+            for row in done.itertuples(index=False)
+        }
+
     def log(self, row: dict[str, Any]) -> None:
         """Append a single row, filling missing columns with empty strings."""
         clean = {col: row.get(col, "") for col in CSV_COLUMNS}
@@ -435,6 +531,8 @@ def _build_analyzer(
     model: str,
     api_key: str | None,
     transcribe: bool,
+    rpm: int,
+    max_requests: int | None,
 ) -> GeminiAnalyzer | LocalAnalyzer:
     """Instantiate the analyzer for the requested backend."""
     if backend == "gemini":
@@ -442,10 +540,34 @@ def _build_analyzer(
             raise RuntimeError(
                 "GEMINI_API_KEY is not set. Add it to your .env file or use --backend local."
             )
-        return GeminiAnalyzer(api_key=api_key, model_name=model)
+        return GeminiAnalyzer(
+            api_key=api_key,
+            model_name=model,
+            rpm=rpm,
+            max_requests=max_requests,
+        )
     if backend == "local":
         return LocalAnalyzer(transcribe=transcribe)
     raise ValueError(f"Unknown backend: {backend!r}")
+
+
+def _build_silent_row(filename: str, chunk_index: int, duration_seconds: float) -> dict[str, Any]:
+    return {
+        "timestamp": _now_iso(),
+        "filename": filename,
+        "chunk_index": chunk_index,
+        "duration_seconds": round(duration_seconds, 3),
+        "frustration_score": -1,
+        "anxiety_score": -1,
+        "sadness_score": -1,
+        "emotional_valence": "",
+        "dominant_emotion": "silent",
+        "confidence": "low",
+        "transcript_excerpt": "unclear",
+        "reasoning": "Chunk skipped locally: signal below silence threshold.",
+        "raw_response": "",
+        "error": "",
+    }
 
 
 def run_pipeline(
@@ -457,6 +579,10 @@ def run_pipeline(
     transcribe: bool = True,
     verbose: bool = False,
     api_key: str | None = None,
+    rpm: int = 10,
+    max_requests: int | None = None,
+    resume: bool = True,
+    silence_dbfs: float = -45.0,
 ) -> dict[str, int]:
     """End-to-end run: discover files, preprocess, analyze, log."""
     api_key = api_key or os.getenv("GEMINI_API_KEY")
@@ -467,13 +593,27 @@ def run_pipeline(
         return {"rows_written": 0, "errors": 0, "successes": 0}
 
     analyzer = _build_analyzer(
-        backend, model=model, api_key=api_key, transcribe=transcribe
+        backend,
+        model=model,
+        api_key=api_key,
+        transcribe=transcribe,
+        rpm=rpm,
+        max_requests=max_requests,
     )
     csv_logger = CSVLogger(output_csv)
     preprocessor = AudioPreprocessor()
 
+    done = csv_logger.already_done() if resume else set()
+    if done:
+        logger.info("Resume: %d chunks already logged; will be skipped.", len(done))
+
+    stopped_early = False
+    skipped_silent = 0
+    skipped_done = 0
     try:
         for file_path in tqdm(files, desc="Analyzing", unit="file"):
+            if stopped_early:
+                break
             try:
                 audio = preprocessor.load_and_convert(file_path)
             except Exception as exc:  # noqa: BLE001 - log + continue batch
@@ -490,12 +630,29 @@ def run_pipeline(
 
             chunks = preprocessor.chunk_audio(audio)
             for idx, chunk in enumerate(chunks):
+                if (file_path.name, idx) in done:
+                    skipped_done += 1
+                    continue
+
                 duration_s = len(chunk) / 1000.0
-                temp_path: Path | None = None
+
+                # Skip silent chunks locally to conserve free-tier requests.
+                if backend == "gemini" and AudioPreprocessor.is_silent(chunk, silence_dbfs):
+                    row = _build_silent_row(file_path.name, idx, duration_s)
+                    csv_logger.log(row)
+                    skipped_silent += 1
+                    if verbose:
+                        tqdm.write(f"[{file_path.name} chunk {idx}] skipped (silent)")
+                    continue
+
                 try:
                     temp_path = preprocessor.export_temp(chunk)
                     parsed = analyzer.analyze(temp_path)
                     row = _build_success_row(file_path.name, idx, duration_s, parsed)
+                except QuotaExhaustedError as exc:
+                    logger.warning("%s Stopping batch cleanly; rerun later to resume.", exc)
+                    stopped_early = True
+                    break
                 except (ValueError, json.JSONDecodeError) as exc:
                     raw = getattr(exc, "raw_response", "")
                     row = _build_error_row(
@@ -527,10 +684,15 @@ def run_pipeline(
         preprocessor.cleanup()
 
     summary = csv_logger.finalize()
+    summary["skipped_silent"] = skipped_silent
+    summary["skipped_already_done"] = skipped_done
+    summary["stopped_early"] = int(stopped_early)
     print(
         f"Done. Rows written: {summary['rows_written']} "
-        f"(successes: {summary['successes']}, errors: {summary['errors']}). "
-        f"Output: {output_csv}"
+        f"(successes: {summary['successes']}, errors: {summary['errors']}, "
+        f"skipped_silent: {skipped_silent}, resume_skipped: {skipped_done}). "
+        + ("Stopped early on quota limit. " if stopped_early else "")
+        + f"Output: {output_csv}"
     )
     return summary
 
@@ -580,6 +742,33 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip Whisper transcription in local backend (faster, no transcript_excerpt).",
     )
     parser.add_argument(
+        "--rpm",
+        type=int,
+        default=10,
+        help="Max Gemini requests per minute (free tier is ~10 for 2.5-flash, "
+        "~15 for 1.5-flash). Set to 0 to disable throttling. Default: 10.",
+    )
+    parser.add_argument(
+        "--max-requests",
+        type=int,
+        default=None,
+        help="Hard cap on Gemini calls this run (useful to stay under daily "
+        "request quota, e.g. --max-requests 200). Default: unlimited.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Re-process every chunk even if a successful row already exists "
+        "in the output CSV. Default: resume on.",
+    )
+    parser.add_argument(
+        "--silence-dbfs",
+        type=float,
+        default=-45.0,
+        help="dBFS threshold for skipping silent chunks locally (Gemini backend "
+        "only). Lower = stricter. Default: -45.0.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print each result to the console as it is processed.",
@@ -597,6 +786,10 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             transcribe=not args.no_transcribe,
             verbose=args.verbose,
+            rpm=args.rpm,
+            max_requests=args.max_requests,
+            resume=not args.no_resume,
+            silence_dbfs=args.silence_dbfs,
         )
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")

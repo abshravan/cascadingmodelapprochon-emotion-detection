@@ -68,6 +68,10 @@ python pipeline.py --input ./samples --output results.csv --verbose
 | `--backend` | `gemini` (cloud) or `local` (offline) | `gemini` |
 | `--model` | Gemini model name (ignored for `local`) | `gemini-2.5-flash` |
 | `--no-transcribe` | Skip Whisper transcription in local backend | off |
+| `--rpm` | Max Gemini requests/minute (free-tier throttle) | `10` |
+| `--max-requests` | Hard cap on Gemini calls this run | unlimited |
+| `--no-resume` | Re-process chunks even if already logged | off |
+| `--silence-dbfs` | dBFS threshold for skipping silent chunks | `-45.0` |
 | `--verbose` | Print each row to the console as it is processed | off |
 
 Supported input formats: `.wav`, `.mp3`, `.m4a`, `.ogg`, `.flac`.
@@ -129,6 +133,40 @@ runs. Each row corresponds to one audio chunk.
 
 A score of `-1` means the model could not analyze the clip (silent, unclear,
 or an API/parse error occurred).
+
+## Free-Tier Tips
+
+The pipeline ships with several optimizations specifically for the Gemini
+free tier (roughly **10 RPM / 250 RPD** on `gemini-2.5-flash`, **15 RPM /
+1,500 RPD** on `gemini-1.5-flash`):
+
+- **Client-side throttling.** Requests are paced to `--rpm` so you don't
+  trigger 429s in the first place. Default 10 RPM matches 2.5-flash.
+- **Server-aware retry.** When a 429 does happen, the retry waits for the
+  exact `retry_delay` Google returns rather than stacking blind exponential
+  backoff on top of it.
+- **Thinking disabled on 2.5-class models.** `thinking_budget=0` cuts
+  per-call token usage 2–3× without hurting structured-JSON output.
+- **Silent-chunk skipping.** Chunks under `--silence-dbfs` (default −45 dB)
+  are scored locally as -1 / "silent" — no API call burned.
+- **Auto-resume.** Reruns read the existing CSV and skip chunks that
+  already have a successful row. Crash, hit your daily quota, or Ctrl-C in
+  the middle of a long batch → just rerun the same command and it picks
+  up where it left off.
+- **Daily budget cap.** `--max-requests N` stops the batch cleanly when
+  you've used N calls, so you can split a large dataset across days.
+
+Recommended free-tier invocation:
+```bash
+python pipeline.py \
+  --input ./samples \
+  --model gemini-2.5-flash \
+  --rpm 10 \
+  --max-requests 200 \
+  --verbose
+```
+Tomorrow, run the exact same command — resume kicks in and only new
+chunks are billed against your fresh daily quota.
 
 ## Error Handling
 

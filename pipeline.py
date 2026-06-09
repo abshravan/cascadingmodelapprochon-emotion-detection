@@ -106,7 +106,11 @@ class AudioPreprocessor:
 
         Skipping silent chunks locally avoids spending free-tier requests on
         clips the model would just return -1 / 'low confidence' for anyway.
+        Short clips (< 10s) are never auto-skipped — they're almost always
+        user-submitted on purpose, not padding inside a longer recording.
         """
+        if len(audio) < 10_000:
+            return False
         dbfs = audio.dBFS
         return dbfs == float("-inf") or dbfs < silence_dbfs
 
@@ -694,6 +698,19 @@ def run_pipeline(
         + ("Stopped early on quota limit. " if stopped_early else "")
         + f"Output: {output_csv}"
     )
+    if summary["successes"] == 0 and skipped_silent > 0:
+        logger.warning(
+            "All %d chunks were skipped as 'silent' (threshold %.1f dBFS). "
+            "If your audio is intentionally quiet, rerun with "
+            "`--silence-dbfs -90` to disable the local skip.",
+            skipped_silent, silence_dbfs,
+        )
+    if summary["successes"] == 0 and summary["errors"] > 0:
+        logger.warning(
+            "All %d chunks errored. Check the `error` column in %s and the "
+            "tail of errors.log for the cause (most common: quota / API key).",
+            summary["errors"], output_csv,
+        )
     return summary
 
 

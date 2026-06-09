@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+emotion_log.csv
+errors.log
+.idea/
+.vscode/

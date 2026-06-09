@@ -199,12 +199,9 @@ class GeminiAnalyzer:
         self._max_requests = max_requests
         self._request_count = 0
 
-        # Free-tier saver: disable "thinking" tokens on 2.5-class models.
-        # The structured-JSON task doesn't need chain-of-thought, and thinking
-        # tokens can easily 2-3x the per-call token cost.
+        # JSON-mode response forces the model to return parseable JSON
+        # without surrounding prose, saving output tokens and parse retries.
         self._generation_config: dict[str, Any] = {"response_mime_type": "application/json"}
-        if "2.5" in model_name:
-            self._generation_config["thinking_config"] = {"thinking_budget": 0}
 
     def analyze(self, audio_path: Path) -> dict[str, Any]:
         """Upload and analyze a single audio clip. Returns parsed dict + raw text."""

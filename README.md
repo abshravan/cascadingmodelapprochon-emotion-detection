@@ -145,10 +145,9 @@ free tier (roughly **10 RPM / 250 RPD** on `gemini-2.5-flash`, **15 RPM /
 - **Server-aware retry.** When a 429 does happen, the retry waits for the
   exact `retry_delay` Google returns rather than stacking blind exponential
   backoff on top of it.
-- **Thinking disabled on 2.5-class models.** `thinking_budget=0` cuts
-  per-call token usage 2–3× without hurting structured-JSON output.
-- **Silent-chunk skipping.** Chunks under `--silence-dbfs` (default −45 dB)
-  are scored locally as -1 / "silent" — no API call burned.
+- **Silent-chunk skipping.** Long-recording chunks under `--silence-dbfs`
+  (default −45 dB) are scored locally as -1 / "silent" — no API call
+  burned. Short user-submitted clips (< 10 s) are never auto-skipped.
 - **Auto-resume.** Reruns read the existing CSV and skip chunks that
   already have a successful row. Crash, hit your daily quota, or Ctrl-C in
   the middle of a long batch → just rerun the same command and it picks

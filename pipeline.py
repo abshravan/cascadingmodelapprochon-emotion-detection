@@ -69,7 +69,10 @@ Scoring guide:
 
 USER_PROMPT: str = "Analyze the attached audio clip and return the JSON object."
 
-GEMINI_MODEL: str = "gemini-2.0-flash"
+GEMINI_MODEL: str = "gemini-1.5-flash"
+
+LOCAL_EMOTION_MODEL: str = "ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
+LOCAL_WHISPER_MODEL: str = "openai/whisper-small"
 
 logger = logging.getLogger("emotion_pipeline")
 
@@ -205,6 +208,131 @@ class GeminiAnalyzer:
         raise last_exc
 
 
+class LocalAnalyzer:
+    """Fully offline emotion analyzer using HuggingFace audio models.
+
+    Uses a wav2vec2 8-class speech emotion classifier and (optionally) Whisper
+    for transcript excerpts. Maps the classifier's softmax probabilities into
+    the same JSON schema produced by GeminiAnalyzer so the CSV output is
+    backend-agnostic.
+    """
+
+    def __init__(
+        self,
+        emotion_model_name: str = LOCAL_EMOTION_MODEL,
+        whisper_model_name: str = LOCAL_WHISPER_MODEL,
+        transcribe: bool = True,
+    ) -> None:
+        import numpy as np
+        import torch
+        from transformers import (
+            AutoFeatureExtractor,
+            AutoModelForAudioClassification,
+        )
+
+        self._np = np
+        self._torch = torch
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        logger.info("Loading local emotion model: %s", emotion_model_name)
+        self._extractor = AutoFeatureExtractor.from_pretrained(emotion_model_name)
+        self._model = (
+            AutoModelForAudioClassification.from_pretrained(emotion_model_name)
+            .to(self._device)
+            .eval()
+        )
+        self._id2label = {int(k): v.lower() for k, v in self._model.config.id2label.items()}
+
+        self._asr = None
+        if transcribe:
+            logger.info("Loading local ASR model: %s", whisper_model_name)
+            from transformers import pipeline as hf_pipeline
+
+            self._asr = hf_pipeline(
+                "automatic-speech-recognition",
+                model=whisper_model_name,
+                device=0 if self._device == "cuda" else -1,
+                chunk_length_s=30,
+            )
+
+    def analyze(self, audio_path: Path) -> dict[str, Any]:
+        """Run emotion classification and (optional) transcription on one chunk."""
+        audio = (
+            AudioSegment.from_file(str(audio_path))
+            .set_channels(1)
+            .set_frame_rate(16_000)
+        )
+        samples = (
+            self._np.array(audio.get_array_of_samples()).astype(self._np.float32) / 32_768.0
+        )
+
+        inputs = self._extractor(
+            samples, sampling_rate=16_000, return_tensors="pt"
+        )
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        with self._torch.no_grad():
+            logits = self._model(**inputs).logits[0]
+        probs = self._torch.softmax(logits, dim=-1).cpu().numpy()
+        prob_map: dict[str, float] = {
+            self._id2label[i]: float(probs[i]) for i in range(len(probs))
+        }
+
+        transcript = "unclear"
+        if self._asr is not None:
+            try:
+                result = self._asr(samples.copy(), generate_kwargs={"language": "en"})
+                text = (result.get("text") or "").strip()
+                transcript = text[:100] if text else "unclear"
+            except Exception as exc:  # noqa: BLE001 - transcript is best-effort
+                logger.warning("Local ASR failed: %s", exc)
+
+        return self._map_to_schema(prob_map, transcript)
+
+    @staticmethod
+    def _map_to_schema(probs: dict[str, float], transcript: str) -> dict[str, Any]:
+        """Convert wav2vec2 class probabilities into the Gemini-shaped schema."""
+        p = lambda key: probs.get(key, 0.0)  # noqa: E731
+
+        frustration = round(10 * min(1.0, p("angry") + 0.5 * p("disgust")))
+        anxiety = round(10 * min(1.0, p("fearful") + 0.3 * p("surprised")))
+        sadness = round(10 * p("sad"))
+
+        dominant_label, dominant_p = max(probs.items(), key=lambda kv: kv[1])
+        negative = p("angry") + p("sad") + p("fearful") + p("disgust")
+        positive = p("happy") + 0.5 * p("calm")
+        if positive > 0.5:
+            valence = "positive"
+        elif negative > 0.5:
+            valence = "negative"
+        else:
+            valence = "neutral"
+
+        if dominant_p >= 0.6:
+            confidence = "high"
+        elif dominant_p >= 0.3:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        top3 = sorted(probs.items(), key=lambda kv: -kv[1])[:3]
+        reasoning = (
+            f"Local wav2vec2 classifier: dominant={dominant_label} ({dominant_p:.2f}). "
+            f"Top probabilities: " + ", ".join(f"{k}={v:.2f}" for k, v in top3) + "."
+        )
+
+        return {
+            "frustration_score": int(frustration),
+            "anxiety_score": int(anxiety),
+            "sadness_score": int(sadness),
+            "emotional_valence": valence,
+            "dominant_emotion": dominant_label,
+            "confidence": confidence,
+            "transcript_excerpt": transcript,
+            "reasoning": reasoning,
+            "raw_response": json.dumps(probs, sort_keys=True),
+        }
+
+
 class CSVLogger:
     """Append-only CSV writer with a fixed schema."""
 
@@ -301,26 +429,46 @@ def _build_success_row(
     }
 
 
+def _build_analyzer(
+    backend: str,
+    *,
+    model: str,
+    api_key: str | None,
+    transcribe: bool,
+) -> GeminiAnalyzer | LocalAnalyzer:
+    """Instantiate the analyzer for the requested backend."""
+    if backend == "gemini":
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is not set. Add it to your .env file or use --backend local."
+            )
+        return GeminiAnalyzer(api_key=api_key, model_name=model)
+    if backend == "local":
+        return LocalAnalyzer(transcribe=transcribe)
+    raise ValueError(f"Unknown backend: {backend!r}")
+
+
 def run_pipeline(
     input_path: Path,
     output_csv: Path,
     *,
+    backend: str = "gemini",
+    model: str = GEMINI_MODEL,
+    transcribe: bool = True,
     verbose: bool = False,
     api_key: str | None = None,
 ) -> dict[str, int]:
     """End-to-end run: discover files, preprocess, analyze, log."""
     api_key = api_key or os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not set. Add it to your .env file or environment."
-        )
 
     files = list(_iter_audio_files(input_path))
     if not files:
         logger.warning("No supported audio files found at %s", input_path)
         return {"rows_written": 0, "errors": 0, "successes": 0}
 
-    analyzer = GeminiAnalyzer(api_key=api_key)
+    analyzer = _build_analyzer(
+        backend, model=model, api_key=api_key, transcribe=transcribe
+    )
     csv_logger = CSVLogger(output_csv)
     preprocessor = AudioPreprocessor()
 
@@ -415,6 +563,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to the output CSV (default: emotion_log.csv).",
     )
     parser.add_argument(
+        "--backend",
+        choices=("gemini", "local"),
+        default="gemini",
+        help="Inference backend: 'gemini' (cloud, needs API key) or 'local' "
+        "(offline HuggingFace models). Default: gemini.",
+    )
+    parser.add_argument(
+        "--model",
+        default=GEMINI_MODEL,
+        help=f"Gemini model name (ignored for --backend local). Default: {GEMINI_MODEL}.",
+    )
+    parser.add_argument(
+        "--no-transcribe",
+        action="store_true",
+        help="Skip Whisper transcription in local backend (faster, no transcript_excerpt).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print each result to the console as it is processed.",
@@ -425,7 +590,14 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(args.verbose)
 
     try:
-        run_pipeline(args.input, args.output, verbose=args.verbose)
+        run_pipeline(
+            args.input,
+            args.output,
+            backend=args.backend,
+            model=args.model,
+            transcribe=not args.no_transcribe,
+            verbose=args.verbose,
+        )
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
         return 130

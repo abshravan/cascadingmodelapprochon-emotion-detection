@@ -1,0 +1,7 @@
+# Extra dependencies for the offline (--backend local) pipeline.
+# Install on top of requirements.txt:
+#   pip install -r requirements.txt -r requirements-local.txt
+torch==2.4.1
+transformers==4.46.3
+numpy==1.26.4
+sentencepiece==0.2.0

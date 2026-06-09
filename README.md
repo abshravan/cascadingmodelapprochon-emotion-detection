@@ -35,12 +35,18 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure API key
+For the **offline** backend (no API needed), also install:
+```bash
+pip install -r requirements-local.txt
+```
+
+### 3. Configure API key (Gemini backend only)
 ```bash
 cp .env.example .env
 # edit .env and set GEMINI_API_KEY=...
 ```
 The key is loaded at runtime via `python-dotenv`; it is never hardcoded.
+Skip this step if you only plan to use `--backend local`.
 
 ## Usage
 
@@ -59,9 +65,45 @@ python pipeline.py --input ./samples --output results.csv --verbose
 | --- | --- | --- |
 | `--input` | Path to an audio file or folder | required |
 | `--output` | Path to the output CSV | `emotion_log.csv` |
+| `--backend` | `gemini` (cloud) or `local` (offline) | `gemini` |
+| `--model` | Gemini model name (ignored for `local`) | `gemini-1.5-flash` |
+| `--no-transcribe` | Skip Whisper transcription in local backend | off |
 | `--verbose` | Print each row to the console as it is processed | off |
 
 Supported input formats: `.wav`, `.mp3`, `.m4a`, `.ogg`, `.flac`.
+
+### Switching backends
+```bash
+# Free cloud model (default)
+python pipeline.py --input ./samples
+
+# Pin to a different Gemini model if you hit free-tier quota
+python pipeline.py --input ./samples --model gemini-2.5-flash
+
+# Fully offline — no API key, no network, no quota
+python pipeline.py --input ./samples --backend local
+
+# Offline + skip transcription for ~3x faster batches
+python pipeline.py --input ./samples --backend local --no-transcribe
+```
+
+### Backend comparison
+| | `--backend gemini` | `--backend local` |
+| --- | --- | --- |
+| Network required | yes | no |
+| API key required | yes | no |
+| Cost | free tier (rate-limited) | free, forever |
+| Score quality | high (LLM reasoning over tone) | moderate (8-class softmax) |
+| First-run latency | ~1 s upload | ~30 s model download (~1.5 GB) |
+| Per-clip latency on CPU | 2–5 s | 1–3 s (emotion) + 5–15 s (transcript) |
+| Transcript quality | high | depends on Whisper size |
+
+The local backend uses
+[`ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition`](https://huggingface.co/ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition)
+for emotion classification and `openai/whisper-small` for transcripts.
+Its 8 classes (angry, calm, disgust, fearful, happy, neutral, sad, surprised)
+are mapped into the same 0–10 frustration / anxiety / sadness scores so the
+CSV schema is identical regardless of backend.
 
 ## CSV Output
 
